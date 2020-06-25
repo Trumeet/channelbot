@@ -1,0 +1,79 @@
+#!/bin/bash
+UPDATES_OFFSET_FILE="/var/lib/channelbot/last_read"
+
+source /etc/channelbot.conf
+
+set -e
+
+TELEGRAM_ENDPOINT="https://api.telegram.org"
+poll() {
+	# JQ query
+	# 1. Ignore messages that are new members, left members, new titles, new photos, etc.
+	# 2. Convert to csv, including message id and chat id
+	local jq=".result | \
+		map(select(.message.new_chat_member == null and \
+					.message.left_chat_member == null and \
+					.message.new_chat_title == null and \
+					.message.new_chat_photo == null and \
+					.message.delete_chat_photo == null and \
+					.message.group_chat_created == null and \
+					.message.supergroup_chat_created == null and \
+					.message.channel_chat_created == null and \
+					.message.migrate_to_chat_id == null and \
+					.message.migrate_from_chat_id == null and \
+					.message.pinned_message == null) \
+			| [.message.message_id,.message.chat.id] | \
+			join(\"|\")) | \
+			join(\"\\n\")"
+	# Check if the last read (offset) file exists.
+	# If so, import the offset argument.
+	local tgreq="$TELEGRAM_ENDPOINT/bot$TELEGRAM_TOKEN/getUpdates"
+	tgreq+="?allowed_updates=message"
+	tgreq+="&timeout=10"
+	if [ -f $UPDATES_OFFSET_FILE ]; then
+		tgreq+="&offset=$(cat $UPDATES_OFFSET_FILE)"
+	fi
+	# Get updates
+	local response=$(curl -s "$tgreq")
+	# Read the last update from the response, then +1 and store it.
+	local newoffset=$(echo $response | jq -r '.result[-1].update_id + 1')
+	if [ "$newoffset" == "null" ]; then
+		# We have no updates
+		echo "_NOUPDATE"
+	else
+		echo $newoffset > $UPDATES_OFFSET_FILE
+		echo $response | jq -r "$jq"
+	fi
+}
+
+while :
+do
+	unset UPDATE
+	UPDATE=$(poll)
+	# We have no updates
+	if [ "$UPDATE" == "_NOUPDATE" ]; then
+		continue
+	fi
+	# Read the updates
+	while IFS="|" read -r msg chat
+	do
+		# Do not process nonrelated messages
+		if [ "$chat" == "$TELEGRAM_FROM" ]; then
+			# Forward link
+	    	text="https://t.me/$TELEGRAM_FROM_LINK/$msg"
+			unset msgid
+        	msgid=$(curl -s -G \
+            	--data-urlencode "chat_id=$TELEGRAM_TO" \
+            	--data-urlencode "text=$text" \
+				"$TELEGRAM_ENDPOINT/bot$TELEGRAM_TOKEN/sendMessage" \
+				| jq -r ".result.message_id")
+
+			# Pin message
+			curl -s -G \
+            	--data-urlencode "chat_id=$TELEGRAM_TO" \
+            	--data-urlencode "message_id=$msgid" \
+            	--data-urlencode "disable_notification=true" \
+				"$TELEGRAM_ENDPOINT/bot$TELEGRAM_TOKEN/pinChatMessage"
+		fi
+	done <<< $UPDATE
+done
